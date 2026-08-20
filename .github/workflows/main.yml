@@ -9,61 +9,84 @@ jobs:
     timeout-minutes: 360
 
     steps:
-      - name: Configure Core RDP Settings
+      - name: Configure RDP
         shell: pwsh
         run: |
-          Write-Host "Configuring Remote Desktop..."
+          Write-Host "Configuring RDP..."
 
-          Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server' -Name 'fDenyTSConnections' -Value 0 -Force
-          Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name 'UserAuthentication' -Value 0 -Force
-          Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name 'SecurityLayer' -Value 0 -Force
+          # Enable Remote Desktop
+          Set-ItemProperty `
+            -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server' `
+            -Name 'fDenyTSConnections' `
+            -Value 0 `
+            -Force
 
+          # Use normal RDP negotiation
+          Set-ItemProperty `
+            -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+            -Name 'SecurityLayer' `
+            -Value 1 `
+            -Force
+
+          # Enable NLA
+          Set-ItemProperty `
+            -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+            -Name 'UserAuthentication' `
+            -Value 1 `
+            -Force
+
+          # Enable RDP firewall rules
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop" -ErrorAction SilentlyContinue
+
+          # Tailscale-only RDP firewall rule
           netsh advfirewall firewall delete rule name="RDP-Tailscale"
           netsh advfirewall firewall add rule name="RDP-Tailscale" dir=in action=allow protocol=TCP localport=3389 remoteip=100.64.0.0/10
 
-          Set-Service -Name TermService -StartupType Automatic
-          Start-Service -Name TermService
+          # Make sure RDP service is alive
+          Set-Service TermService -StartupType Automatic
+          Restart-Service TermService -Force
 
-          Write-Host "RDP configuration complete."
+          Start-Sleep -Seconds 5
 
-      - name: Create RDP User with Secure Password
+          Write-Host "RDP listeners:"
+          qwinsta
+
+          Get-NetTCPConnection -LocalPort 3389 -State Listen -ErrorAction SilentlyContinue
+
+      - name: Configure Administrator Account
         shell: pwsh
+        env:
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
         run: |
-          $charSet = @{
-              Upper   = [char[]](65..90)
-              Lower   = [char[]](97..122)
-              Number  = [char[]](48..57)
-              Special = [char[]]'!@#$%*-_+='
-          }
+          $user = Get-LocalUser -Name "Administrator" -ErrorAction Stop
 
-          $rawPassword = @()
-          $rawPassword += $charSet.Upper | Get-Random -Count 4
-          $rawPassword += $charSet.Lower | Get-Random -Count 4
-          $rawPassword += $charSet.Number | Get-Random -Count 4
-          $rawPassword += $charSet.Special | Get-Random -Count 4
+          $securePass = ConvertTo-SecureString `
+            $env:RDP_PASSWORD `
+            -AsPlainText `
+            -Force
 
-          $password = -join ($rawPassword | Sort-Object { Get-Random })
-          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+          Set-LocalUser `
+            -Name "Administrator" `
+            -Password $securePass `
+            -AccountNeverExpires
 
-          $existingUser = Get-LocalUser -Name 'RDP' -ErrorAction SilentlyContinue
+          Enable-LocalUser -Name "Administrator"
 
-          if ($existingUser) {
-              Set-LocalUser -Name 'RDP' -Password $securePass
-          } else {
-              New-LocalUser -Name 'RDP' -Password $securePass -AccountNeverExpires
-          }
+          Add-LocalGroupMember `
+            -Group "Remote Desktop Users" `
+            -Member "Administrator" `
+            -ErrorAction SilentlyContinue
 
-          Add-LocalGroupMember -Group 'Administrators' -Member 'RDP' -ErrorAction SilentlyContinue
-          Add-LocalGroupMember -Group 'Remote Desktop Users' -Member 'RDP' -ErrorAction SilentlyContinue
+          Write-Host "Administrator enabled."
 
-          "RDP_PASSWORD=$password" >> $env:GITHUB_ENV
+          $admin = Get-LocalUser -Name "Administrator"
 
-          if (-not (Get-LocalUser -Name 'RDP' -ErrorAction SilentlyContinue)) {
-              Write-Error "RDP user creation failed."
+          Write-Host "Enabled: $($admin.Enabled)"
+
+          if (-not $admin.Enabled) {
+              Write-Error "Administrator account is disabled."
               exit 1
           }
-
-          Write-Host "RDP user created successfully."
 
       - name: Install Tailscale
         shell: pwsh
@@ -71,88 +94,93 @@ jobs:
           $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
           $installerPath = "$env:TEMP\tailscale.msi"
 
-          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
+          Invoke-WebRequest `
+            -Uri $tsUrl `
+            -OutFile $installerPath
 
-          Start-Process msiexec.exe `
+          Start-Process `
+            msiexec.exe `
             -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" `
             -Wait
 
           Remove-Item $installerPath -Force
 
-      - name: Establish Tailscale Connection
+      - name: Connect Tailscale
         shell: pwsh
         env:
           TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
         run: |
-          $tailscale = "$env:ProgramFiles\Tailscale\tailscale.exe"
+          $ts = "$env:ProgramFiles\Tailscale\tailscale.exe"
 
-          if (-not (Test-Path $tailscale)) {
-              Write-Error "Tailscale executable not found."
-              exit 1
-          }
-
-          & $tailscale up `
+          & $ts up `
             --authkey="$env:TAILSCALE_AUTH_KEY" `
-            --hostname="gh-runner-$env:GITHUB_RUN_ID"
+            --hostname="gh-rdp-$env:GITHUB_RUN_ID"
 
           $tsIP = $null
 
-          for ($i = 0; $i -lt 12; $i++) {
-              $tsIP = (& $tailscale ip -4 2>$null | Select-Object -First 1)
+          for ($i = 0; $i -lt 20; $i++) {
+              $tsIP = (& $ts ip -4 2>$null | Select-Object -First 1)
 
               if ($tsIP) {
                   break
               }
 
-              Write-Host "Waiting for Tailscale IP..."
-              Start-Sleep -Seconds 5
+              Write-Host "Waiting for Tailscale..."
+              Start-Sleep -Seconds 3
           }
 
           if (-not $tsIP) {
-              Write-Error "Tailscale IP not assigned."
+              Write-Error "No Tailscale IP."
               exit 1
           }
 
           "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
-          Write-Host "Tailscale connected: $tsIP"
 
-      - name: Verify RDP Accessibility
+          Write-Host "================================"
+          Write-Host "Tailscale IP: $tsIP"
+          Write-Host "Username    : Administrator"
+          Write-Host "================================"
+
+      - name: Verify RDP
         shell: pwsh
         run: |
-          Write-Host "Tailscale IP: $env:TAILSCALE_IP"
+          Write-Host "Checking TermService..."
 
-          $service = Get-Service -Name TermService
+          $service = Get-Service TermService
 
-          if ($service.Status -ne 'Running') {
-              Write-Error "Remote Desktop service is not running."
+          Write-Host "Status: $($service.Status)"
+
+          if ($service.Status -ne "Running") {
+              Write-Error "TermService isn't running."
               exit 1
           }
 
-          $listener = Get-NetTCPConnection -LocalPort 3389 -State Listen -ErrorAction SilentlyContinue
+          Write-Host "Checking port 3389..."
 
-          if (-not $listener) {
-              Write-Error "Nothing is listening on TCP port 3389."
+          $rdp = Get-NetTCPConnection `
+            -LocalPort 3389 `
+            -State Listen `
+            -ErrorAction SilentlyContinue
+
+          if (-not $rdp) {
+              Write-Error "RDP is not listening on port 3389."
               exit 1
           }
 
-          $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
+          Write-Host "RDP listener OK."
 
-          if (-not $testResult.TcpTestSucceeded) {
-              Write-Error "TCP connection to RDP port 3389 failed."
-              exit 1
-          }
-
-          Write-Host "RDP TCP connectivity successful."
+          qwinsta
 
       - name: Maintain Connection
         shell: pwsh
         run: |
           Write-Host ""
-          Write-Host "========== RDP ACCESS =========="
+          Write-Host "================================="
+          Write-Host "         RDP READY"
+          Write-Host "================================="
           Write-Host "Address : $env:TAILSCALE_IP"
-          Write-Host "Username: RDP"
-          Write-Host "Password: $env:RDP_PASSWORD"
-          Write-Host "================================"
+          Write-Host "Username: Administrator"
+          Write-Host "================================="
           Write-Host ""
 
           while ($true) {
