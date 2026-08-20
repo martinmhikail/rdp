@@ -9,181 +9,404 @@ jobs:
     timeout-minutes: 360
 
     steps:
+
+      # ============================================================
+      # 1. CONFIGURE WINDOWS RDP
+      # ============================================================
       - name: Configure RDP
         shell: pwsh
         run: |
-          Write-Host "Configuring RDP..."
+          $ErrorActionPreference = "Stop"
+
+          Write-Host "================================="
+          Write-Host " Configuring Windows Remote Desktop"
+          Write-Host "================================="
 
           # Enable Remote Desktop
-          Set-ItemProperty `
-            -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server' `
-            -Name 'fDenyTSConnections' `
-            -Value 0 `
-            -Force
+          Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server' -Name 'fDenyTSConnections' -Value 0 -Force
 
-          # Use normal RDP negotiation
-          Set-ItemProperty `
-            -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-            -Name 'SecurityLayer' `
-            -Value 1 `
-            -Force
+          # Normal RDP security negotiation
+          Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name 'SecurityLayer' -Value 1 -Force
 
-          # Enable NLA
-          Set-ItemProperty `
-            -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-            -Name 'UserAuthentication' `
-            -Value 1 `
-            -Force
+          # Enable Network Level Authentication
+          Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name 'UserAuthentication' -Value 1 -Force
 
-          # Enable RDP firewall rules
+          # RDP TCP port
+          Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name 'PortNumber' -Value 3389 -Force
+
+          # Enable built-in Remote Desktop firewall rules
           Enable-NetFirewallRule -DisplayGroup "Remote Desktop" -ErrorAction SilentlyContinue
 
-          # Tailscale-only RDP firewall rule
-          netsh advfirewall firewall delete rule name="RDP-Tailscale"
+          # Remove our previous custom rule
+          netsh advfirewall firewall delete rule name="RDP-Tailscale" | Out-Null
+
+          # Allow port 3389 only from Tailscale IPv4 CGNAT range
           netsh advfirewall firewall add rule name="RDP-Tailscale" dir=in action=allow protocol=TCP localport=3389 remoteip=100.64.0.0/10
 
-          # Make sure RDP service is alive
-          Set-Service TermService -StartupType Automatic
-          Restart-Service TermService -Force
+          # Configure Remote Desktop service
+          Set-Service -Name TermService -StartupType Automatic
+
+          $service = Get-Service -Name TermService
+
+          if ($service.Status -eq "Running") {
+              Restart-Service -Name TermService -Force
+          } else {
+              Start-Service -Name TermService
+          }
 
           Start-Sleep -Seconds 5
 
-          Write-Host "RDP listeners:"
+          Write-Host ""
+          Write-Host "=== TermService ==="
+          Get-Service TermService | Format-Table Name, Status, StartType
+
+          Write-Host ""
+          Write-Host "=== RDP Sessions ==="
           qwinsta
 
-          Get-NetTCPConnection -LocalPort 3389 -State Listen -ErrorAction SilentlyContinue
+          Write-Host ""
+          Write-Host "RDP configuration finished."
 
+
+      # ============================================================
+      # 2. CREATE / CONFIGURE ADMINISTRATOR USER
+      # ============================================================
       - name: Configure Administrator Account
         shell: pwsh
         env:
           RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
         run: |
-          $user = Get-LocalUser -Name "Administrator" -ErrorAction Stop
+          $ErrorActionPreference = "Stop"
 
-          $securePass = ConvertTo-SecureString `
-            $env:RDP_PASSWORD `
-            -AsPlainText `
-            -Force
+          Write-Host "================================="
+          Write-Host " Configuring Administrator Account"
+          Write-Host "================================="
 
-          Set-LocalUser `
-            -Name "Administrator" `
-            -Password $securePass `
-            -AccountNeverExpires
+          if ([string]::IsNullOrWhiteSpace($env:RDP_PASSWORD)) {
+              Write-Error "RDP_PASSWORD secret is empty or missing."
+              exit 1
+          }
 
+          $securePass = ConvertTo-SecureString $env:RDP_PASSWORD -AsPlainText -Force
+
+          $user = Get-LocalUser -Name "Administrator" -ErrorAction SilentlyContinue
+
+          if ($null -eq $user) {
+
+              Write-Host "Administrator account not found."
+              Write-Host "Creating Administrator account..."
+
+              New-LocalUser `
+                -Name "Administrator" `
+                -Password $securePass `
+                -AccountNeverExpires `
+                -PasswordNeverExpires `
+                -Description "RDP Administrator"
+
+          } else {
+
+              Write-Host "Administrator already exists."
+              Write-Host "Updating password..."
+
+              Set-LocalUser `
+                -Name "Administrator" `
+                -Password $securePass
+
+              Set-LocalUser `
+                -Name "Administrator" `
+                -AccountNeverExpires `
+                -PasswordNeverExpires $true
+          }
+
+          # Enable account
           Enable-LocalUser -Name "Administrator"
 
+          # Add to Administrators
+          Add-LocalGroupMember `
+            -Group "Administrators" `
+            -Member "Administrator" `
+            -ErrorAction SilentlyContinue
+
+          # Add to Remote Desktop Users
           Add-LocalGroupMember `
             -Group "Remote Desktop Users" `
             -Member "Administrator" `
             -ErrorAction SilentlyContinue
 
-          Write-Host "Administrator enabled."
+          # Verify
+          $check = Get-LocalUser -Name "Administrator" -ErrorAction Stop
 
-          $admin = Get-LocalUser -Name "Administrator"
+          Write-Host ""
+          Write-Host "=== ACCOUNT CHECK ==="
+          Write-Host "Username : $($check.Name)"
+          Write-Host "Enabled  : $($check.Enabled)"
+          Write-Host "SID      : $($check.SID)"
+          Write-Host "====================="
 
-          Write-Host "Enabled: $($admin.Enabled)"
-
-          if (-not $admin.Enabled) {
+          if (-not $check.Enabled) {
               Write-Error "Administrator account is disabled."
               exit 1
           }
 
+          Write-Host "Administrator account ready."
+
+
+      # ============================================================
+      # 3. INSTALL TAILSCALE
+      # ============================================================
       - name: Install Tailscale
         shell: pwsh
         run: |
+          $ErrorActionPreference = "Stop"
+
+          Write-Host "=============================="
+          Write-Host " Installing Tailscale"
+          Write-Host "=============================="
+
           $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
           $installerPath = "$env:TEMP\tailscale.msi"
+
+          Write-Host "Downloading Tailscale..."
 
           Invoke-WebRequest `
             -Uri $tsUrl `
             -OutFile $installerPath
 
-          Start-Process `
-            msiexec.exe `
+          if (-not (Test-Path $installerPath)) {
+              Write-Error "Tailscale installer download failed."
+              exit 1
+          }
+
+          Write-Host "Installing Tailscale..."
+
+          $process = Start-Process `
+            -FilePath "msiexec.exe" `
             -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" `
-            -Wait
+            -Wait `
+            -PassThru
 
-          Remove-Item $installerPath -Force
+          if ($process.ExitCode -ne 0) {
+              Write-Error "Tailscale installation failed. Exit code: $($process.ExitCode)"
+              exit 1
+          }
 
+          Remove-Item $installerPath -Force -ErrorAction SilentlyContinue
+
+          $tailscale = "$env:ProgramFiles\Tailscale\tailscale.exe"
+
+          if (-not (Test-Path $tailscale)) {
+              Write-Error "tailscale.exe was not found after installation."
+              exit 1
+          }
+
+          Write-Host "Tailscale installed successfully."
+
+
+      # ============================================================
+      # 4. CONNECT TO TAILSCALE
+      # ============================================================
       - name: Connect Tailscale
         shell: pwsh
         env:
           TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
         run: |
+          $ErrorActionPreference = "Stop"
+
+          Write-Host "=============================="
+          Write-Host " Connecting Tailscale"
+          Write-Host "=============================="
+
+          if ([string]::IsNullOrWhiteSpace($env:TAILSCALE_AUTH_KEY)) {
+              Write-Error "TAILSCALE_AUTH_KEY secret is empty or missing."
+              exit 1
+          }
+
           $ts = "$env:ProgramFiles\Tailscale\tailscale.exe"
+
+          if (-not (Test-Path $ts)) {
+              Write-Error "tailscale.exe not found."
+              exit 1
+          }
+
+          $hostname = "gh-rdp-$env:GITHUB_RUN_ID"
+
+          Write-Host "Hostname: $hostname"
 
           & $ts up `
             --authkey="$env:TAILSCALE_AUTH_KEY" `
-            --hostname="gh-rdp-$env:GITHUB_RUN_ID"
+            --hostname="$hostname"
+
+          if ($LASTEXITCODE -ne 0) {
+              Write-Error "tailscale up failed."
+              exit 1
+          }
+
+          Write-Host "Waiting for Tailscale IPv4 address..."
 
           $tsIP = $null
 
-          for ($i = 0; $i -lt 20; $i++) {
-              $tsIP = (& $ts ip -4 2>$null | Select-Object -First 1)
+          for ($i = 1; $i -le 20; $i++) {
 
-              if ($tsIP) {
+              $candidate = (
+                  & $ts ip -4 2>$null |
+                  Select-Object -First 1
+              )
+
+              if (-not [string]::IsNullOrWhiteSpace($candidate)) {
+                  $tsIP = $candidate.Trim()
                   break
               }
 
-              Write-Host "Waiting for Tailscale..."
+              Write-Host "Attempt $i/20 - waiting..."
               Start-Sleep -Seconds 3
           }
 
-          if (-not $tsIP) {
-              Write-Error "No Tailscale IP."
+          if ([string]::IsNullOrWhiteSpace($tsIP)) {
+              Write-Error "Tailscale IPv4 address was not assigned."
               exit 1
           }
 
           "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+          "RDP_HOSTNAME=$hostname" >> $env:GITHUB_ENV
 
-          Write-Host "================================"
-          Write-Host "Tailscale IP: $tsIP"
-          Write-Host "Username    : Administrator"
-          Write-Host "================================"
+          Write-Host ""
+          Write-Host "=============================="
+          Write-Host " TAILSCALE CONNECTED"
+          Write-Host "=============================="
+          Write-Host "IP       : $tsIP"
+          Write-Host "Hostname : $hostname"
+          Write-Host "=============================="
 
+
+      # ============================================================
+      # 5. VERIFY RDP
+      # ============================================================
       - name: Verify RDP
         shell: pwsh
         run: |
-          Write-Host "Checking TermService..."
+          $ErrorActionPreference = "Stop"
 
-          $service = Get-Service TermService
+          Write-Host "=============================="
+          Write-Host " Verifying RDP"
+          Write-Host "=============================="
 
-          Write-Host "Status: $($service.Status)"
+          Write-Host ""
+          Write-Host "Tailscale IP: $env:TAILSCALE_IP"
+
+          # Check TermService
+          $service = Get-Service -Name TermService
+
+          Write-Host "TermService status: $($service.Status)"
 
           if ($service.Status -ne "Running") {
-              Write-Error "TermService isn't running."
+
+              Write-Host "TermService isn't running. Starting..."
+
+              Start-Service TermService
+
+              Start-Sleep -Seconds 3
+          }
+
+          # Check account
+          $user = Get-LocalUser -Name "Administrator" -ErrorAction SilentlyContinue
+
+          if ($null -eq $user) {
+              Write-Error "Administrator user does not exist."
               exit 1
           }
 
-          Write-Host "Checking port 3389..."
+          if (-not $user.Enabled) {
+              Write-Error "Administrator account is disabled."
+              exit 1
+          }
 
-          $rdp = Get-NetTCPConnection `
+          Write-Host "Administrator account: OK"
+
+          # Check RDP listener
+          Write-Host ""
+          Write-Host "Checking TCP port 3389..."
+
+          $listener = Get-NetTCPConnection `
             -LocalPort 3389 `
             -State Listen `
             -ErrorAction SilentlyContinue
 
-          if (-not $rdp) {
-              Write-Error "RDP is not listening on port 3389."
+          if (-not $listener) {
+
+              Write-Host "No listener found. Restarting TermService..."
+
+              Restart-Service TermService -Force
+
+              Start-Sleep -Seconds 5
+
+              $listener = Get-NetTCPConnection `
+                -LocalPort 3389 `
+                -State Listen `
+                -ErrorAction SilentlyContinue
+          }
+
+          if (-not $listener) {
+              Write-Error "RDP is not listening on TCP port 3389."
               exit 1
           }
 
-          Write-Host "RDP listener OK."
+          Write-Host "Port 3389 listener: OK"
 
+          Write-Host ""
+          Write-Host "Testing Tailscale IP port 3389..."
+
+          $test = Test-NetConnection `
+            -ComputerName $env:TAILSCALE_IP `
+            -Port 3389 `
+            -WarningAction SilentlyContinue
+
+          Write-Host "TcpTestSucceeded: $($test.TcpTestSucceeded)"
+
+          if (-not $test.TcpTestSucceeded) {
+              Write-Error "RDP connection test failed."
+              exit 1
+          }
+
+          Write-Host ""
+          Write-Host "=== RDP SESSION INFO ==="
           qwinsta
 
+          Write-Host ""
+          Write-Host "RDP verification successful."
+
+
+      # ============================================================
+      # 6. KEEP WORKFLOW ACTIVE
+      # ============================================================
       - name: Maintain Connection
         shell: pwsh
         run: |
           Write-Host ""
-          Write-Host "================================="
-          Write-Host "         RDP READY"
-          Write-Host "================================="
+          Write-Host "========================================"
+          Write-Host "              RDP READY"
+          Write-Host "========================================"
+          Write-Host ""
           Write-Host "Address : $env:TAILSCALE_IP"
-          Write-Host "Username: Administrator"
-          Write-Host "================================="
+          Write-Host "Username: .\Administrator"
+          Write-Host ""
+          Write-Host "Password: use your RDP_PASSWORD secret"
+          Write-Host ""
+          Write-Host "========================================"
+          Write-Host "Connect through your Tailscale network."
+          Write-Host "Cancel the workflow when finished."
+          Write-Host "========================================"
           Write-Host ""
 
           while ($true) {
-              Write-Host "[$(Get-Date)] RDP active"
+
+              $service = Get-Service TermService -ErrorAction SilentlyContinue
+
+              if ($service.Status -ne "Running") {
+                  Write-Host "[$(Get-Date)] TermService stopped - restarting..."
+                  Start-Service TermService
+              }
+
+              Write-Host "[$(Get-Date)] RDP active at $env:TAILSCALE_IP"
+
               Start-Sleep -Seconds 300
           }
